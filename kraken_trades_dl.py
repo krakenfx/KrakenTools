@@ -149,7 +149,7 @@ while count>1:
 		print str(datetime.fromtimestamp(math.ceil(dt_end)))+" : "+str(x)+" : "+str(count)
 		
 		#Sleep So We Don't Timeout the Api
-		time.sleep(5)
+		time.sleep(10)
 		x+=1
 	except Exception, e:
 	    print "Error Script Died"
