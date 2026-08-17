@@ -1,157 +1,169 @@
+"""Download private Kraken trade history to a tab-separated file.
+
+Credentials are read from environment variables and the script performs
+read-only API calls. It never retries a request after an uncertain response.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import csv
+import hashlib
+import hmac
 import json
-import time,hmac,base64,hashlib,urllib,urllib2,json
-from hashlib import sha256
-from decimal import Decimal
-import datetime
-from datetime import datetime
-import sys
 import os
-import math
-import calendar
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
-class kraken:
-	timeout = 15
-	tryout = 0
-
-	def __init__(self, key=None, secret=None, agent='Kraken PHP API Agent'):
-		self.key, self.secret, self.agent = key, secret, agent
-		self.time = {'init': time.time(), 'req': time.time()}
-		self.reqs = {'max': 10, 'window': 10, 'curr': 0}
-		self.base = 'https://api.kraken.com'
-		
-	def throttle(self):
-		# check that in a given time window (10 seconds),
-		# no more than a maximum number of requests (10)
-		# have been sent, otherwise sleep for a bit
-		diff = time.time() - self.time['req']
-		if diff > self.reqs['window']:
-			self.reqs['curr'] = 0
-			self.time['req'] = time.time()
-		self.reqs['curr'] += 1
-		if self.reqs['curr'] > self.reqs['max']:
-			print 'Request limit reached...'
-			time.sleep(self.reqs['window'] - diff)
-
-	def makereq(self, path, data , nonce):
-		
-		# bare-bones hmac rest sign
-		sign=str(hmac.new(base64.b64decode(self.secret), path +
-				  sha256(nonce+data).digest()
-				  , hashlib.sha512).digest())
-		return urllib2.Request(self.base + path, data, {
-			'User-Agent': self.agent,
-			'API-Key: ': self.key,
-			'API-Sign: ': base64.b64encode(sign)
-		})
-
-	def req(self, path, inp={}):
-		t0 = time.time()
-		tries = 0
-		while True:
-			# check if have been making too many requests
-			self.throttle()
-
-			try:
-				# send request to mtgox
-				n=str(int(time.time() * 1e6))
-				inp['nonce'] = n
-				inpstr = urllib.urlencode(inp.items())
-				req = self.makereq(path, inpstr,n)
-				response = urllib2.urlopen(req, inpstr)
-
-				# interpret json response
-				output = json.load(response)
-				if 'error' in output:
-					if output['error']!=[]:
-						print output
-						raise ValueError(output['error'])
+API_BASE = "https://api.kraken.com"
+API_VERSION = "0"
+REQUEST_TIMEOUT_SECONDS = 15
 
 
-				return output['result']
-				
-			except Exception as e:
-				print "Error: %s" % e
-
-			# don't wait too long
-			tries += 1
-			if time.time() - t0 > self.timeout or tries > self.tryout:
-				raise Exception('Timeout')
-
-
-key='KEY GOES HERE'
-secret='SECRET GOES HERE'
-
-api_version="/0/"
-krak = kraken(key,secret)
-pairs={}
-ledger_type="deposit"
-
-header=""
-header+="timestamp"+"\t"
-header+='fee'+"\t"
-header+='vol'+"\t"
-header+='ordertype'+"\t"
-header+='ordertxid'+"\t"
-header+='pair'+"\t"
-header+='cost'+"\t"
-header+='type'+"\t"
-header+='price'+"\n"
-
-results=open('trades.txt','w')
-results.write(header)
+def sign_private_request(secret: str, path: str, nonce: str, payload: bytes) -> str:
+    """Return Kraken's base64-encoded HMAC-SHA512 request signature."""
+    secret_bytes = base64.b64decode(secret, validate=True)
+    message = path.encode("utf-8") + hashlib.sha256(
+        nonce.encode("utf-8") + payload
+    ).digest()
+    return base64.b64encode(hmac.new(secret_bytes, message, hashlib.sha512).digest()).decode(
+        "ascii"
+    )
 
 
-dt_end=None    
-x=0
-count=10
-while count>1:
-	count=0	
-	try:
-		if dt_end == None:
-			txs=krak.req(api_version+'private/TradesHistory')
-		else:
-			txs=krak.req(api_version+'private/TradesHistory',{'end':dt_end})
-		
-		ledger_items=txs['trades']
-		for tx in ledger_items:
-			count+=1
+def request_private(
+    api_key: str,
+    api_secret: str,
+    method: str,
+    parameters: dict[str, str],
+) -> dict[str, Any]:
+    """Perform one authenticated read-only request."""
+    nonce = str(time.time_ns() // 1_000)
+    request_parameters = {"nonce": nonce, **parameters}
+    encoded_payload = urlencode(request_parameters).encode("utf-8")
+    path = f"/{API_VERSION}/private/{method}"
+    request = Request(
+        f"{API_BASE}{path}",
+        data=encoded_payload,
+        headers={
+            "User-Agent": "KrakenTools trade history downloader",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "API-Key": api_key,
+            "API-Sign": sign_private_request(
+                api_secret, path, nonce, encoded_payload
+            ),
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read())
+    except (HTTPError, URLError) as error:
+        raise RuntimeError(f"Kraken request failed: {error}") from error
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Kraken returned invalid JSON") from error
 
-			t=math.ceil(ledger_items[tx]['time'])
+    if not isinstance(payload, dict):
+        raise RuntimeError("Kraken returned an unexpected response shape")
+    if payload.get("error"):
+        raise RuntimeError(f"Kraken API error: {payload['error']}")
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError("Kraken response did not contain a result object")
+    return result
 
-			#DT_END becomes the highest time from the result set
-			if dt_end==None:
-				dt_end=ledger_items[tx]['time']
-			elif dt_end>ledger_items[tx]['time']:
-				dt_end=ledger_items[tx]['time']
-			
-			try:
-				dt_print=str(datetime.fromtimestamp(t))
-			except:
-				dt_print="N\A"
-			
-			#Construct THe Row
-			print_string=""
-			print_string+=dt_print+"\t"
-			print_string+=str(ledger_items[tx]['fee'])+"\t"
-			print_string+=str(ledger_items[tx]['vol'])+"\t"
-			print_string+=str(ledger_items[tx]['ordertype'])+"\t"
-			print_string+=str(ledger_items[tx]['ordertxid'])+"\t"
-			print_string+=str(ledger_items[tx]['pair'])+"\t"
-			print_string+=str(ledger_items[tx]['cost'])+"\t"
-			print_string+=str(ledger_items[tx]['type'])+"\t"
-			print_string+=str(ledger_items[tx]['price'])+"\n"
 
-			#Print and Flush it
-			results.write(print_string)
-			results.flush()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=Path("trades.txt"))
+    parser.add_argument("--page-size", type=int, default=50)
+    return parser.parse_args()
 
-		#How Many Rows were added... Most likely the max at 50
-		print str(datetime.fromtimestamp(math.ceil(dt_end)))+" : "+str(x)+" : "+str(count)
-		
-		#Sleep So We Don't Timeout the Api
-		time.sleep(10)
-		x+=1
-	except Exception, e:
-	    print "Error Script Died"
-	    print str(e)     
 
+def main() -> int:
+    args = parse_args()
+    if args.page_size <= 0:
+        raise ValueError("page-size must be positive")
+
+    api_key = os.environ.get("KRAKEN_API_KEY")
+    api_secret = os.environ.get("KRAKEN_API_SECRET")
+    if not api_key or not api_secret:
+        raise RuntimeError("KRAKEN_API_KEY and KRAKEN_API_SECRET are required")
+
+    with args.output.open("w", newline="", encoding="utf-8") as output_file:
+        writer = csv.writer(output_file, delimiter="\t", lineterminator="\n")
+        writer.writerow(
+            [
+                "timestamp",
+                "fee",
+                "vol",
+                "ordertype",
+                "ordertxid",
+                "pair",
+                "cost",
+                "type",
+                "price",
+            ]
+        )
+        end: str | None = None
+        seen_trade_ids: set[str] = set()
+        while True:
+            parameters = {"ofs": "0"}
+            if end is not None:
+                parameters["end"] = end
+            result = request_private(api_key, api_secret, "TradesHistory", parameters)
+            trades = result.get("trades")
+            if not isinstance(trades, dict) or not trades:
+                break
+
+            oldest_timestamp: float | None = None
+            rows_written = 0
+            for trade_id, trade in trades.items():
+                if trade_id in seen_trade_ids or not isinstance(trade, dict):
+                    continue
+                timestamp = float(trade.get("time", 0))
+                oldest_timestamp = (
+                    timestamp
+                    if oldest_timestamp is None
+                    else min(oldest_timestamp, timestamp)
+                )
+                writer.writerow(
+                    [
+                        datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat(),
+                        trade.get("fee", ""),
+                        trade.get("vol", ""),
+                        trade.get("ordertype", ""),
+                        trade.get("ordertxid", ""),
+                        trade.get("pair", ""),
+                        trade.get("cost", ""),
+                        trade.get("type", ""),
+                        trade.get("price", ""),
+                    ]
+                )
+                seen_trade_ids.add(trade_id)
+                rows_written += 1
+            output_file.flush()
+            print(f"{rows_written} trades processed; total: {len(seen_trade_ids)}")
+
+            if oldest_timestamp is None:
+                break
+            next_end = str(int(oldest_timestamp))
+            if end is not None and next_end >= end:
+                break
+            end = next_end
+            time.sleep(1)
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (RuntimeError, ValueError) as error:
+        raise SystemExit(f"Error: {error}") from error
